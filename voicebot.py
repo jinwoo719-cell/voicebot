@@ -1,17 +1,53 @@
 """
-오늘 뭐 듣지? — 음성으로 오늘의 노래를 추천받는 프로그램
+오늘 뭐 듣지?  —  말로 기분을 말하면 오늘의 한 곡을 골라주는 프로그램
 
 교재 <진짜 챗GPT API 활용법> PART 03 '나만의 음성 비서 만들기'를 바탕으로,
-OpenAI(Whisper + GPT) 대신 Google Gemini API를 사용하고
-'노래 추천'이라는 목적에 맞게 다시 만든 버전입니다.
+OpenAI(Whisper + GPT) 대신 Google Gemini를 쓰고 목적을 '노래 추천'으로 좁혔습니다.
 
-  [교재]    녹음 -> STT(Whisper) -> 답변(GPT) -> TTS(gTTS) -> 재생   (API 2회)
-  [본 코드] 녹음 -> 받아쓰기+추천을 Gemini 한 번에 -> TTS(gTTS)       (API 1회)
+
+┌─ 전체 흐름 ────────────────────────────────────────────────────────┐
+│                                                                    │
+│   사용자가 말한다   "비 오는 날 새벽에 혼자 듣기 좋은 노래"            │
+│         │                                                          │
+│         ▼   st.audio_input  ......................... 496행         │
+│   녹음된 WAV 바이트                                                  │
+│         │                                                          │
+│         ▼   빈 파일 / 12MB 초과 / 같은 녹음 걸러내기 .... 516행        │
+│   통과한 오디오                                                      │
+│         │                                                          │
+│         ▼   recommend()  ★ 핵심 ..................... 216행         │
+│   Gemini 한 번 호출 → JSON 6개 필드                                  │
+│     transcript  말한 내용 그대로                                     │
+│     title       곡 제목          reason      추천 이유               │
+│     artist      가수             background  노래 배경               │
+│     one_liner   한 줄 소개  ← 이것만 음성으로 읽음                     │
+│         │                                                          │
+│         ▼   session_state에 누적 ................... 378행          │
+│   대화 기록 (다음 질문에 문맥이 이어짐)                                │
+│         │                                                          │
+│         ├──▶  render_recommendation()  카드 그리기 ... 319행         │
+│         └──▶  TTS()  한 줄 소개만 음성 재생 ........... 275행         │
+│                                                                    │
+└────────────────────────────────────────────────────────────────────┘
+
+
+교재와 가장 다른 점 — API를 두 번이 아니라 한 번만 부릅니다
+
+    [교재]    녹음 → Whisper로 받아쓰기 → 그 텍스트를 GPT에 다시 전송 → 답변
+              (왕복 2회)
+
+    [본 코드] 녹음 → Gemini에 "오디오 + 지시문"을 한 번에 전송
+              → 받아쓴 문장과 추천을 JSON으로 동시에 받음
+              (왕복 1회)
+
 
 실행:  streamlit run voicebot.py
+테스트: python3 test_voicebot.py   (API 키·인터넷 없이 115개 항목 검증)
 """
 
-##### 1. 패키지 불러오기 #####
+# ══════════════════════════════════════════════════════════════════════
+#  1. 패키지 불러오기
+# ══════════════════════════════════════════════════════════════════════
 import base64                       # mp3를 HTML에 심기 위한 인코딩
 import hashlib                      # 같은 녹음을 중복 처리하지 않기 위한 해시
 import html                         # 사용자 입력을 HTML에 넣을 때 이스케이프
@@ -19,6 +55,7 @@ import json                         # Gemini가 돌려준 JSON 파싱
 import re                           # 한글 포함 여부 판별
 from datetime import datetime       # 말풍선에 표시할 시각
 from io import BytesIO              # gTTS 결과를 메모리에서 다루기 위함
+from zoneinfo import ZoneInfo       # 서버가 UTC라서 한국 시간으로 변환
 
 import streamlit as st              # 웹 UI
 from google import genai            # Gemini API
@@ -26,12 +63,27 @@ from google.genai import types      # 오디오/설정을 넘길 때 쓰는 타�
 from gtts import gTTS               # TTS (Google Translate TTS)
 
 
-##### 2. 상수 정의 #####
+# ══════════════════════════════════════════════════════════════════════
+#  2. 상수  —  "어떤 형식으로 답하게 할지"를 여기서 정합니다
+# ══════════════════════════════════════════════════════════════════════
 APP_TITLE = "오늘 뭐 듣지?"
 APP_SUBTITLE = "말로 기분을 들려주세요. 오늘의 한 곡을 골라드립니다."
 
+# 배포 서버(Streamlit Cloud)의 시간대는 UTC입니다.
+# 그대로 두면 말풍선 시각이 9시간 어긋나므로 한국 시간으로 변환합니다.
+KST = ZoneInfo("Asia/Seoul")
+
 # 라디오 버튼에 노출할 Gemini 모델. 두 모델 모두 오디오 입력을 지원합니다.
 MODELS = ["gemini-2.5-flash", "gemini-3.6-flash"]
+
+# 오디오 크기 상한.
+# Gemini는 인라인 오디오를 포함한 요청 전체를 20MB로 제한합니다.
+# base64로 인코딩하면 약 1.33배가 되므로 12MB(약 6분)에서 미리 끊습니다.
+MAX_AUDIO_BYTES = 12 * 1024 * 1024
+
+# 데모 앱이므로 한 세션에서 쓸 수 있는 횟수를 제한합니다.
+# (공개 배포 + 서버에 저장된 키 조합이라 방문자가 할당량을 소진할 수 있음)
+MAX_TURNS_PER_SESSION = 10
 
 # 역할과 답변 형식을 정해 주는 시스템 프롬프트
 SYSTEM_PROMPT = """\
@@ -66,7 +118,14 @@ Listen to the attached audio and do BOTH tasks in one response:
                    확실하지 않은 사실은 쓰지 마세요.
 """
 
-# Gemini가 이 형태로만 답하도록 강제하는 스키마 (구조화 출력)
+# ★ 발표 포인트 ─ 구조화 출력(response_schema)
+#
+# 교재는 답변을 자유 텍스트로 받습니다. 그러면 매번 형태가 달라서
+# "곡명은 여기, 이유는 여기" 하고 화면에 배치할 수가 없습니다.
+#
+# 목적을 '노래 추천'으로 좁히니 필요한 항목이 정해졌고,
+# 그러자 아래처럼 스키마로 못 박을 수 있게 됐습니다.
+# 모델이 형식을 어길 수 없으니 카드 UI를 그릴 수 있습니다.
 RECOMMENDATION_SCHEMA = {
     "type": "object",
     "properties": {
@@ -84,7 +143,17 @@ RECOMMENDATION_SCHEMA = {
 }
 
 
-##### 3. 기능 구현 함수 #####
+# ══════════════════════════════════════════════════════════════════════
+#  3. 기능 구현 함수
+#
+#     load_default_apikey()   배포 환경의 Secrets에서 API 키 읽기
+#     normalize_mime()        브라우저마다 다른 오디오 형식 이름 맞추기
+#     get_client()            Gemini 클라이언트 (타임아웃·재시도 설정)
+#     recommend()             ★ 받아쓰기 + 추천을 한 번에            <- 핵심
+#     TTS()                   한 줄 소개를 mp3로 만들어 자동 재생
+#     render_user_bubble()    말한 내용을 파란 말풍선으로
+#     render_recommendation() 추천 결과를 카드로
+# ══════════════════════════════════════════════════════════════════════
 def load_default_apikey() -> str:
     """배포 환경(Streamlit Cloud)의 Secrets에 키가 있으면 그것을 씁니다.
 
@@ -134,14 +203,19 @@ def get_client(apikey: str) -> genai.Client:
     )
 
 
+# ─────────────────────────────────────────────────────────────────────
+#  ★ 이 프로젝트의 핵심 함수
+#
+#  교재는 이렇게 두 번 부릅니다
+#      STT(audio)      → Whisper가 받아쓴 텍스트
+#      ask_gpt(텍스트)  → GPT가 만든 답변
+#
+#  Gemini는 오디오와 지시문을 함께 받을 수 있어서 한 번이면 됩니다
+#      recommend(audio) → 받아쓴 문장 + 추천을 JSON으로 한꺼번에
+# ─────────────────────────────────────────────────────────────────────
 def recommend(audio_bytes: bytes, mime_type: str, history: list,
               apikey: str, model: str) -> dict:
-    """오디오를 넘겨 '받아쓰기 + 노래 추천'을 한 번에 받아 옵니다.
-
-    교재는 STT(Whisper)와 답변(GPT)을 따로 호출해서 왕복이 두 번이었습니다.
-    Gemini는 오디오와 지시문을 같이 받을 수 있으므로 한 번에 끝냅니다.
-    응답이 흐트러지지 않도록 response_schema로 형식을 강제합니다.
-    """
+    """오디오를 넘겨 '받아쓰기 + 노래 추천'을 한 번에 받아 옵니다."""
     client = get_client(apikey)
 
     # 이전 대화를 먼저 넣어야 "아까랑 다른 걸로" 같은 후속 요청이 통합니다.
@@ -160,21 +234,42 @@ def recommend(audio_bytes: bytes, mime_type: str, history: list,
         )
     )
 
-    response = client.models.generate_content(
-        model=model,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            response_mime_type="application/json",
-            response_schema=RECOMMENDATION_SCHEMA,
-        ),
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        response_mime_type="application/json",
+        response_schema=RECOMMENDATION_SCHEMA,
     )
 
-    # 스키마를 강제했어도 안전 필터 등으로 빈 응답이 올 수 있습니다.
+    # Gemini 2.5 계열은 '생각하기'가 기본으로 켜져 있습니다.
+    # 노래 한 곡 고르는 작업에는 과한 기능이라, 껐더니 응답이 눈에 띄게 빨라졌습니다.
+    # (Gemini 3 계열은 설정 이름이 달라서 손대지 않습니다)
+    if model.startswith("gemini-2.5"):
+        config.thinking_config = types.ThinkingConfig(thinking_budget=0)
+
+    response = client.models.generate_content(
+        model=model, contents=contents, config=config
+    )
+
+    # 스키마를 강제했어도 안전 필터나 토큰 초과로 응답이 깨질 수 있습니다.
     raw = (response.text or "").strip()
     if not raw:
-        raise ValueError("Gemini가 빈 응답을 돌려주었습니다.")
-    return json.loads(raw)
+        raise ValueError("Gemini가 빈 응답을 돌려주었습니다. 다시 시도해 주세요.")
+
+    data = json.loads(raw)
+
+    # json.loads는 문자열이나 배열도 통과시킵니다.
+    # 여기서 걸러내지 않으면 화면을 그릴 때 AttributeError로 앱이 죽습니다.
+    if not isinstance(data, dict):
+        raise ValueError("Gemini 응답이 JSON 객체가 아닙니다.")
+
+    # 스키마가 필수라고 해도 빈 문자열은 통과합니다.
+    # 빈 카드가 그려지고 대화 기록까지 오염되므로 여기서 막습니다.
+    missing = [k for k in ("title", "artist", "one_liner")
+               if not str(data.get(k, "")).strip()]
+    if missing:
+        raise ValueError(f"응답에 빠진 항목이 있습니다: {', '.join(missing)}")
+
+    return data
 
 
 def TTS(text: str) -> None:
@@ -264,13 +359,24 @@ def render_recommendation(rec: dict, time: str) -> None:
     )
 
 
-##### 4. 메인 함수 #####
+# ══════════════════════════════════════════════════════════════════════
+#  4. 메인 함수  —  화면 구성과 처리 순서
+#
+#     스트림릿은 버튼 하나만 눌러도 이 함수를 처음부터 끝까지 다시 실행합니다.
+#     그래서 유지돼야 하는 값은 전부 st.session_state에 넣습니다.
+#
+#     [세션 상태]  chat  messages  GEMINI_API  last_audio_id
+#                  audio_round  last_error
+#     [사이드바]    API 키 상태 · 모델 선택 · 초기화
+#     [왼쪽 col1]   녹음 위젯 → 가드 → recommend() 호출 → 상태 저장
+#     [오른쪽 col2] 카드 렌더링 → 한 줄 소개 음성 재생
+# ══════════════════════════════════════════════════════════════════════
 def main():
     # --- 기본 설정 ---
     st.set_page_config(page_title=APP_TITLE, page_icon="🎧", layout="wide")
 
     # --- 세션 상태 초기화 ---
-    # 화면에 그릴 기록: {"time": ..., "said": ..., "rec": {...}}
+    # 화면에 그릴 기록. 한 턴 = {"time": 시각, "said": 말한 내용, "rec": 추천 결과}
     if "chat" not in st.session_state:
         st.session_state["chat"] = []
 
@@ -290,6 +396,10 @@ def main():
     # 초기화할 때 이 번호를 올리면 위젯이 새것으로 교체되어 녹음이 비워집니다.
     if "audio_round" not in st.session_state:
         st.session_state["audio_round"] = 0
+
+    # 직전 실패 사유. 재실행돼도 화면에 남기기 위해 세션에 보관합니다.
+    if "last_error" not in st.session_state:
+        st.session_state["last_error"] = None
 
     # 이번 실행에서 새로 나온 추천 (있으면 마지막에 음성으로 읽어 줍니다)
     new_one_liner = None
@@ -346,11 +456,22 @@ def main():
         model = st.radio(label="Gemini 모델", options=MODELS)
         st.markdown("---")
 
-        # 초기화 버튼
+        # ★ 발표 포인트 ─ 초기화 버튼에서 만난 버그
+        #
+        # 처음에는 chat / messages / last_audio_id 만 비웠습니다. 그랬더니
+        # 초기화를 눌러도 지운 대화가 곧바로 되살아났습니다.
+        #
+        #   초기화 → 상태 비움 → st.rerun()
+        #     → 재실행: 녹음 위젯에는 아까 녹음이 그대로 남아 있음
+        #     → 해시가 None과 다르니 "새 녹음이네!" → 처음부터 다시 처리
+        #
+        # 아래 audio_round 를 올리면 녹음 위젯의 key가 바뀝니다.
+        # 스트림릿은 key가 다르면 '다른 위젯'으로 보고 빈 상태로 새로 만듭니다.
         if st.button(label="초기화"):
             st.session_state["chat"] = []
             st.session_state["messages"] = []
             st.session_state["last_audio_id"] = None
+            st.session_state["last_error"] = None
             # ⚠️ 회차를 올려 녹음 위젯을 새것으로 갈아 끼웁니다.
             # 이게 없으면 위젯에 남아 있던 녹음이 그대로 반환되고,
             # last_audio_id를 None으로 비운 탓에 '새 녹음'으로 판정되어
@@ -388,13 +509,40 @@ def main():
         if audio is not None:
             audio_bytes = audio.getvalue()
             # 녹음 내용의 해시를 지문으로 삼아, 새 녹음일 때만 처리합니다.
-            audio_id = hashlib.md5(audio_bytes).hexdigest()
+            # (보안이 아니라 '같은 데이터인지' 비교용이라 md5로 충분합니다)
+            audio_id = hashlib.md5(audio_bytes, usedforsecurity=False).hexdigest()
             is_new_audio = audio_id != st.session_state["last_audio_id"]
 
-            if is_new_audio and not st.session_state["GEMINI_API"]:
+            if not audio_bytes:
+                st.error("빈 오디오입니다. 다시 녹음해 주세요.")
+
+            elif len(audio_bytes) > MAX_AUDIO_BYTES:
+                # Gemini는 인라인 오디오 요청을 20MB로 제한합니다.
+                # 넘겨보고 실패하는 대신 여기서 미리 안내합니다.
+                st.error(
+                    f"녹음이 너무 깁니다 ({len(audio_bytes) / 1048576:.1f}MB). "
+                    f"{MAX_AUDIO_BYTES // 1048576}MB(약 6분) 이하로 해 주세요."
+                )
+
+            elif not is_new_audio:
+                # 같은 녹음이 다시 들어온 경우. 조용히 넘어가면 사용자는
+                # 앱이 멈춘 줄 알기 때문에, 왜 아무 일도 없는지 알려 줍니다.
+                if st.session_state["chat"]:
+                    st.caption(
+                        "방금 처리한 것과 같은 녹음입니다. "
+                        "새로 녹음하거나 사이드바에서 초기화해 주세요."
+                    )
+
+            elif not st.session_state["GEMINI_API"]:
                 st.warning("사이드바에 Gemini API 키를 입력해 주세요.")
 
-            elif is_new_audio:
+            elif len(st.session_state["chat"]) >= MAX_TURNS_PER_SESSION:
+                st.warning(
+                    f"데모 앱이라 한 번에 {MAX_TURNS_PER_SESSION}곡까지만 추천합니다. "
+                    "사이드바에서 초기화해 주세요."
+                )
+
+            else:
                 # API 호출 '전에' 기록합니다. 실패해도 무한 재시도하지 않도록.
                 st.session_state["last_audio_id"] = audio_id
 
@@ -407,12 +555,15 @@ def main():
                             st.session_state["GEMINI_API"],
                             model,
                         )
+                        st.session_state["last_error"] = None
                     except Exception as e:
                         rec = None
-                        st.error(f"추천에 실패했습니다: {e}")
+                        # 에러를 세션에 남깁니다. 여기서 st.error만 부르면
+                        # 다음 재실행 때 메시지가 사라져 원인을 볼 수 없습니다.
+                        st.session_state["last_error"] = str(e)
 
                 if rec:
-                    now = datetime.now().strftime("%H:%M")
+                    now = datetime.now(KST).strftime("%H:%M")
                     said = (rec.get("transcript") or "").strip()
 
                     # 화면에 그릴 기록. 한 번의 대화를 한 덩어리로 묶어 둡니다.
@@ -421,7 +572,8 @@ def main():
                         {"time": now, "said": said, "rec": rec}
                     )
 
-                    # 다음 요청에 문맥이 이어지도록 대화 기록에도 저장
+                    # 다음 요청에 문맥이 이어지도록 대화 기록에도 저장.
+                    # 오디오는 넣지 않고 텍스트만 쌓아서 토큰을 아낍니다.
                     st.session_state["messages"].append(
                         {"role": "user", "content": said or "(무음)"}
                     )
@@ -433,6 +585,15 @@ def main():
                     )
 
                     new_one_liner = rec.get("one_liner")
+
+        # 실패했다면 원인을 보여 주고, 같은 녹음으로 다시 시도할 길을 열어 둡니다.
+        # (해시 가드 때문에 그냥 두면 같은 녹음으로는 영영 재시도할 수 없습니다)
+        if st.session_state["last_error"]:
+            st.error(f"추천에 실패했습니다: {st.session_state['last_error']}")
+            if st.button("같은 녹음으로 다시 시도"):
+                st.session_state["last_audio_id"] = None
+                st.session_state["last_error"] = None
+                st.rerun()
 
     with col2:
         # 오른쪽 영역: 추천 결과
