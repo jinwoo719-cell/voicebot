@@ -229,27 +229,31 @@ def render_recommendation(rec: dict, time: str) -> None:
     reason = html.escape(rec.get("reason", ""))
     background = html.escape(rec.get("background", ""))
 
+    # ⚠️ 카드 배경을 밝은 색으로 고정했으므로 글자색도 반드시 함께 고정해야 합니다.
+    # 색을 지정하지 않으면 스트림릿 테마의 글자색을 물려받는데,
+    # 다크 모드에서는 그 색이 흰색이라 흰 배경 위에서 글자가 보이지 않습니다.
+    # (모바일 다크 모드에서 제목과 본문이 통째로 안 보이는 버그를 겪었습니다)
     st.markdown(
         f"""
         <div style="border:1px solid #e3e6ea;border-radius:14px;padding:18px 20px;
-                    background:#fafbfc;margin-bottom:1.2rem;">
-          <div style="font-size:1.25rem;font-weight:700;line-height:1.3;">
+                    background:#fafbfc;color:#1a1d21;margin-bottom:1.2rem;">
+          <div style="font-size:1.25rem;font-weight:700;line-height:1.3;color:#1a1d21;">
             🎵 {title}
           </div>
           <div style="color:#6b7280;font-size:0.95rem;margin-top:2px;">{artist}</div>
           <div style="margin-top:12px;padding:10px 14px;background:#eef4ff;
-                      border-radius:10px;font-size:0.95rem;">
+                      color:#1a1d21;border-radius:10px;font-size:0.95rem;">
             {one_liner}
           </div>
           <div style="margin-top:16px;">
             <div style="font-size:0.75rem;letter-spacing:0.04em;color:#6b7280;
                         font-weight:700;">추천 이유</div>
-            <div style="margin-top:4px;line-height:1.65;">{reason}</div>
+            <div style="margin-top:4px;line-height:1.65;color:#1a1d21;">{reason}</div>
           </div>
           <div style="margin-top:14px;">
             <div style="font-size:0.75rem;letter-spacing:0.04em;color:#6b7280;
                         font-weight:700;">노래 배경</div>
-            <div style="margin-top:4px;line-height:1.65;">{background}</div>
+            <div style="margin-top:4px;line-height:1.65;color:#1a1d21;">{background}</div>
           </div>
           <div style="text-align:right;font-size:0.8rem;color:gray;margin-top:10px;">
             {html.escape(time)}
