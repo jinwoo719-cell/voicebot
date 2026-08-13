@@ -178,17 +178,23 @@ def main():
 
     # --- 사이드바 ---
     with st.sidebar:
-        # API 키 입력
-        st.session_state["GEMINI_API"] = st.text_input(
-            label="GEMINI API 키",
-            placeholder="Enter your API Key",
-            value=st.session_state["GEMINI_API"],
-            type="password",
-        )
-        st.markdown(
-            "[API 키 발급받기](https://aistudio.google.com/app/apikey)",
-            help="Google AI Studio에서 무료로 발급받을 수 있습니다.",
-        )
+        secret_key = load_default_apikey()
+
+        if secret_key:
+            st.session_state["GEMINI_API"] = secret_key
+            st.success("API 키가 설정되어 있습니다.", icon="🔑")
+            st.caption("서버(Secrets)에 저장된 키를 사용합니다.")
+        else:
+            st.session_state["GEMINI_API"] = st.text_input(
+                label="GEMINI API 키",
+                placeholder="Enter your API Key",
+                value=st.session_state["GEMINI_API"],
+                type="password",
+            )
+            st.markdown(
+                "[API 키 발급받기](https://aistudio.google.com/app/apikey)",
+                help="Google AI Studio에서 무료로 발급받을 수 있습니다.",
+            )
         st.markdown("---")
 
         # 모델 선택
