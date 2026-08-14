@@ -8,7 +8,8 @@ OpenAI(Whisper + GPT) 대신 Google Gemini를 쓰고 목적을 '노래 추천'�
 ┌─ 전체 흐름 ────────────────────────────────────────────────────────┐
 │                                                                    │
 │   사용자가 말한다   "비 오는 날 새벽에 혼자 듣기 좋은 노래"            │
-│         │                                                          │
+│         │                                       
+│
 │         ▼   st.audio_input  ......................... 496행         │
 │   녹음된 WAV 바이트                                                  │
 │         │                                                          │
@@ -118,14 +119,10 @@ Listen to the attached audio and do BOTH tasks in one response:
                    확실하지 않은 사실은 쓰지 마세요.
 """
 
-# ★ 발표 포인트 ─ 구조화 출력(response_schema)
-#
-# 교재는 답변을 자유 텍스트로 받습니다. 그러면 매번 형태가 달라서
-# "곡명은 여기, 이유는 여기" 하고 화면에 배치할 수가 없습니다.
+# 구조화 출력(response_schema)
 #
 # 목적을 '노래 추천'으로 좁히니 필요한 항목이 정해졌고,
-# 그러자 아래처럼 스키마로 못 박을 수 있게 됐습니다.
-# 모델이 형식을 어길 수 없으니 카드 UI를 그릴 수 있습니다.
+# 그러자 아래처럼 스키마로 못 박아 카드 UI를 그릴 수 있음.
 RECOMMENDATION_SCHEMA = {
     "type": "object",
     "properties": {
@@ -223,7 +220,8 @@ def recommend(audio_bytes: bytes, mime_type: str, history: list,
         types.Content(role=m["role"], parts=[types.Part(text=m["content"])])
         for m in history
     ]
-    # 이번 차례: 지시문 + 오디오
+    # 지시문과 오디오를 함께 넣어 보냄. "받아쓰고, 그 내용에 맞는 곡을 고름."
+    # STT(오디오) 로 글자를 얻고, 그 글자를 ask_gpt()에 다시 보냄
     contents.append(
         types.Content(
             role="user",
